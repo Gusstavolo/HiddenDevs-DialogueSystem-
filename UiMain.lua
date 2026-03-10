@@ -1,1 +1,0 @@
-_G.DialoguesSet = require(script.Parent.Modules:WaitForChild('DialogueGui'))
