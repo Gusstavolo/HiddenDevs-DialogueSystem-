@@ -1,251 +1,217 @@
--- Full box-opening system in a single server script.
--- A box is dragged onto the workbench, a countdown starts,
--- bubbles float up and can be clicked to speed up the timer,
--- and when it hits zero the box pops open and drops a reward.
---
--- Concepts used: metatables, CFrame math, RunService.Heartbeat,
--- TweenService, DataStoreService, CollectionService, DragDetector,
--- OverlapParams, polar coordinate spawning, state machine pattern.
+local Players = game:GetService("Players") -- getting the players
+local RunService = game:GetService("RunService") -- need this for game loops
+local TweenService = game:GetService("TweenService") -- for smooth animations
+local Debris = game:GetService("Debris") -- to delete things after a while so it doesn't lag
+local CollectionService = game:GetService("CollectionService") -- to group similar objects together
+local DataStoreService = game:GetService("DataStoreService") -- for saving player data
 
--- ─────────────────────────────────────────────────────────────
--- SERVICES
--- ─────────────────────────────────────────────────────────────
+local ReplicatedStorage = game:GetService("ReplicatedStorage") -- stuff both client and server can use
 
-local Players           = game:GetService("Players")              -- player join/leave and character access
-local RunService        = game:GetService("RunService")           -- Heartbeat for frame-by-frame updates
-local TweenService      = game:GetService("TweenService")         -- smooth animations on parts and GUIs
-local Debris            = game:GetService("Debris")               -- auto-destroys instances after a delay
-local CollectionService = game:GetService("CollectionService")    -- tags models so any script can identify them
-local DataStoreService  = game:GetService("DataStoreService")     -- persistent storage across sessions
+local Assets = ReplicatedStorage:WaitForChild("Assets") -- folder with our models and things
+local boxTemplate = Assets:WaitForChild("Box"):WaitForChild("Box") -- the main box we copy every time it spawns
+local popTemplate = Assets:WaitForChild("Pops"):WaitForChild("PopTime") -- the bubble effect we copy
+local rewardFolder = Assets:WaitForChild("Rewards") -- where we keep the rewards
 
--- ─────────────────────────────────────────────────────────────
--- ASSETS
--- ─────────────────────────────────────────────────────────────
+local rewardPool = rewardFolder:GetChildren() -- making a list of all the rewards inside the folder
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local WorkbenchFolder = workspace:WaitForChild("Workbench") -- holds all workbench models in the map
+local BoxSpawnModel = workspace:WaitForChild("BoxSpawn") -- this is where the box first appears for the player
+local spawnAnchor = BoxSpawnModel:WaitForChild("Pos") -- the exact spot to put the new box
 
-local Assets         = ReplicatedStorage:WaitForChild("Assets")               -- root assets folder
-local boxTemplate    = Assets:WaitForChild("Box"):WaitForChild("Box")         -- Model cloned for each box spawn
-local popTemplate    = Assets:WaitForChild("Pops"):WaitForChild("PopTime")    -- Model cloned for each bubble
-local rewardFolder   = Assets:WaitForChild("Rewards")
-
-
--- This avoids a repeated engine call and keeps the table stable.
-local rewardPool = rewardFolder:GetChildren()
-
-local WorkbenchFolder = workspace:WaitForChild("Workbench")   -- folder that holds all workbench models
-local BoxSpawnModel   = workspace:WaitForChild("BoxSpawn")    -- where the draggable box first appears
-local spawnAnchor     = BoxSpawnModel:WaitForChild("Pos")     -- Part whose CFrame is the box spawn point
-
--- ─────────────────────────────────────────────────────────────
--- CONFIG
--- Every number that affects gameplay is here so tuning is easy.
--- ─────────────────────────────────────────────────────────────
 
 local Config = {}
 
--- Box spawn / drag
-Config.DragMaxForce        = 50000   -- max force the DragDetector applies while the player drags
-Config.DragMaxTorque       = 50000   -- max torque so the box can spin while being carried
-Config.DragActivationDist  = 15      -- studs the player must be within to start a drag
-Config.DragDistanceLimit   = 20      -- studs; drag is cut if the player goes further than this
-Config.DragYOffset         = 5       -- extra Y lift applied to the box while it is being dragged
+Config.DragMaxForce  = 50000    -- how strong the dragging is, so the player can actually pull it
+Config.DragMaxTorque = 50000    -- lets the box spin a bit while holding it
+Config.DragActivationDist = 15      -- how close you need to be to grab it
+Config.DragDistanceLimit  = 20      -- drops the box if you walk too far away
+Config.DragYOffset  = 5       -- lifts the box a bit so it doesn't drag on the floor
 
--- Workbench opening timer
-Config.OpenDuration        = 18.0    -- full countdown length in seconds
-Config.TimerFloor          = 4.0     -- timer can never drop below this value no matter how many bubbles are popped
-Config.TimerUpdateRate     = 0.05    -- how often the label refreshes (seconds); lower = smoother but more overhead
 
--- Bubbles
-Config.BubbleInterval      = 1.8     -- seconds between each new bubble spawn
-Config.BubbleMinLife       = 3.0     -- minimum seconds a bubble lives before auto-popping
-Config.BubbleMaxLife       = 6.5     -- maximum seconds before it pops on its own
-Config.BubbleFloatSpeed    = 2.2     -- studs per second the bubble rises
-Config.BubbleSpawnRadius   = 5.0     -- horizontal radius around the workbench slot where bubbles appear
-Config.BubbleSpawnYMin     = 2.0     -- minimum height offset above the slot
-Config.BubbleSpawnYMax     = 3.5     -- maximum height offset above the slot
-Config.BubbleWobbleAmp     = 0.18    -- how far left/right the wobble sways each cycle
-Config.BubbleWobbleSpeed   = 2.5     -- how fast the wobble cycles (radians per second)
-Config.BubbleClickReduction = 2.5    -- seconds removed from the timer when a player clicks a bubble
-Config.BubblePopScale      = 2.8     -- how large the bubble grows in the pop animation
-Config.BubblePopDuration   = 0.18    -- seconds the pop tween takes
+Config.OpenDuration  = 18.0    -- how long it takes to open normally
+Config.TimerFloor = 4.0     -- minimum wait time, you can't open it instantly
+Config.TimerUpdateRate = 0.05    -- updates the text timer super fast to look smooth
 
--- Reward
-Config.RewardDragForce     = 40000   -- MaxForce on the reward item's DragDetector
-Config.RewardLifetime      = 30      -- seconds before an unclaimed reward despawns automatically
-Config.BoxOpenAnimTime     = 0.55    -- seconds the box scale/fade animation takes
+Config.BubbleInterval = 1.8     -- time before a new bubble shows up
+Config.BubbleMinLife = 3.0     -- at least 3 seconds before the bubble pops itself
+Config.BubbleMaxLife = 6.5     -- bubble is gone after this much time
+Config.BubbleFloatSpeed = 2.2     -- how fast the bubble goes up
+Config.BubbleSpawnRadius = 5.0     -- how far from the middle bubbles can spawn
+Config.BubbleSpawnYMin = 2.0     -- lowest spawn point for a bubble
+Config.BubbleSpawnYMax  = 3.5     -- highest spawn point for a bubble
+Config.BubbleWobbleAmp = 0.18    -- makes the bubble move side to side a bit
+Config.BubbleWobbleSpeed = 2.5     -- how fast it shakes side to side
+Config.BubbleClickReduction = 2.5    -- clicking a bubble skips this much time
+Config.BubblePopScale = 2.8     -- bubble gets bigger right before it pops
+Config.BubblePopDuration = 0.18    -- how fast the pop animation plays
 
--- DataStore
-Config.DataStoreName       = "WorkbenchBoxCount_v1"
 
--- ─────────────────────────────────────────────────────────────
--- STATE ENUM
--- Using a plain table of strings instead of numbers makes
--- print/warn output readable without a reverse-lookup table.
--- ─────────────────────────────────────────────────────────────
+Config.RewardDragForce = 40000   -- strength needed to grab the reward item
+Config.RewardLifetime = 30      -- delete the reward if nobody takes it
+Config.BoxOpenAnimTime = 0.55    -- time it takes for the box to disappear when opened
 
-local State = {
-	Idle    = "Idle",      -- workbench is empty and waiting for a box
-	Opening = "Opening",   -- countdown is running and bubbles are active
-	Opened  = "Opened",    -- box has opened; reward is sitting on the bench
+
+Config.DataStoreName       = "WorkbenchBoxCount_v1" -- name of the save file for the database
+
+local State = { -- workbench states
+	Idle    = "Idle",      -- waiting for someone to put a box here
+	Opening = "Opening",   -- counting down and popping bubbles
+	Opened  = "Opened",    -- box is open, get your reward
 }
 
--- ─────────────────────────────────────────────────────────────
--- DATA  (session registry + DataStore wrapper)
--- ─────────────────────────────────────────────────────────────
-
-local BoxStore = DataStoreService:GetDataStore(Config.DataStoreName)   -- the actual persistent store
-
+local BoxStore = DataStoreService:GetDataStore(Config.DataStoreName)   -- where we actually save the player's data
 local sessions = {}   -- [userId] = { boxesOpened = number, dirty = boolean }
 
--- Loads saved data for a player when they join; creates a fresh session if none exists.
+-- Loading the player's save file when they join
 local function loadSession(player: Player)
-	local key = "player_" .. tostring(player.UserId)
+	local key = "player_" .. tostring(player.UserId) -- the unique name to find this exact player's save
 
+	-- trying to get their saved data without breaking the game if it fails
 	local ok, stored = pcall(function()
 		return BoxStore:GetAsync(key)
 	end)
 
 	local count = 0
+	-- if we found their save, use that number. if not, they start at 0
 	if ok and stored and stored.boxesOpened then
 		count = stored.boxesOpened
 	end
 
+	-- saving their info locally so we don't have to ask the database every second
 	sessions[player.UserId] = {
 		key         = key,
 		boxesOpened = count,
-		dirty       = false,
+		dirty       = false, -- 'dirty' just means "did the score change? do we need to save it?"
 	}
 
-	-- Create the leaderstats folder that Roblox uses to display stats on the leaderboard.
-	
+	-- making the folder so players can see their score on the top right (leaderboard)
 	local leaderstats = Instance.new("Folder")
 	leaderstats.Name   = "leaderstats"
 	leaderstats.Parent = player
 
-
+	-- creating the actual score number for "Boxes Opened"
 	local boxesValue = Instance.new("IntValue")
-	boxesValue.Name   = "Boxes Opened"   -- this is what players see in the leaderboard tab
-	boxesValue.Value  = count            -- pre-fill with the saved value so it's correct on join
+	boxesValue.Name = "Boxes Opened" 
+	boxesValue.Value = count       
 	boxesValue.Parent = leaderstats
 end
 
+-- What happens when they finally open a box
 local function recordBoxOpened(player: Player)
 	local session = sessions[player.UserId]
-	if not session then return end
+	if not session then return end -- if we don't have their info, just stop here
 
 	session.boxesOpened += 1
-	session.dirty        = true
+	session.dirty        = true -- mark that the score changed and we need to save it later
 
-	
+	-- update the screen so the player sees the new number go up
 	local leaderstats = player:FindFirstChild("leaderstats")
 	if leaderstats then
 		local boxesValue = leaderstats:FindFirstChild("Boxes Opened")
 		if boxesValue then
-			boxesValue.Value = session.boxesOpened   -- update the visible number immediately
+			boxesValue.Value = session.boxesOpened  
 		end
 	end
 
+	-- quickly save the new score to the database right now, just to be safe
 	pcall(function()
 		BoxStore:UpdateAsync(session.key, function()
 			return { boxesOpened = session.boxesOpened }
 		end)
 	end)
 
-	session.dirty = false
+	session.dirty = false -- score is saved, so it's not 'dirty' anymore
 end
 
--- Saves a player's session to the DataStore, then removes it from memory.
+-- Saving player stuff when they leave the game
 local function saveSession(player: Player)
-	local session = sessions[player.UserId]   -- look up their session
-	if not session then return end             -- nothing to save if the session never loaded
+	local session = sessions[player.UserId] 
+	if not session then return end   
 
-	if session.dirty then   -- only hit the network if something actually changed
+	-- only save if their score actually changed, so we don't spam the database for nothing
+	if session.dirty then  
 		pcall(function()
 			BoxStore:UpdateAsync(session.key, function()
-				return { boxesOpened = session.boxesOpened }   -- always write the full snapshot
+				return { boxesOpened = session.boxesOpened } 
 			end)
 		end)
 	end
 
-	sessions[player.UserId] = nil   -- free the memory regardless of whether the save succeeded
+	sessions[player.UserId] = nil -- remove their info from the local list since they left
 end
 
-
--- Hook DataStore lifecycle into player events.
+-- whenever someone joins, load their stuff
 Players.PlayerAdded:Connect(function(player)
-	task.spawn(loadSession, player)   -- load in a separate thread so we don't block the event
+	task.spawn(loadSession, player)
 end)
 
+-- whenever someone leaves, save their stuff
 Players.PlayerRemoving:Connect(function(player)
-	saveSession(player)   -- save synchronously on the way out before the player object is cleaned up
+	saveSession(player)
 end)
 
-for _, p in ipairs(Players:GetPlayers()) do   -- handle anyone already in the server at startup
+-- if someone is already in the game when this script starts, load their stuff too
+for _, p in ipairs(Players:GetPlayers()) do  
 	task.spawn(loadSession, p)
 end
 
--- ─────────────────────────────────────────────────────────────
--- BOX SPAWN
--- ─────────────────────────────────────────────────────────────
 
--- Clones the box template, places it at the anchor, and wires up
--- a full DragDetector with distance limiting and a PlacedBy attribute.
 local function spawnBox()
-	local box = boxTemplate:Clone()            -- duplicate the template model
-	box.Parent = BoxSpawnModel                 -- nest it in the spawn folder
-	box:PivotTo(spawnAnchor.WorldCFrame)       -- snap to the anchor's world position and rotation
+	local box = boxTemplate:Clone()   -- making a new box from the template
+	box.Parent = BoxSpawnModel   -- putting it in the spawn area
+	box:PivotTo(spawnAnchor.WorldCFrame) -- moving it to the exact starting spot
 
-	CollectionService:AddTag(box, "Box")       -- tag it so workbench detection can identify it
+	CollectionService:AddTag(box, "Box")  -- tagging it so the game knows this is a real box
 
-	local dd = Instance.new("DragDetector")                             -- create the drag component
-	dd.ResponseStyle         = Enum.DragDetectorResponseStyle.Physical  -- physics-driven movement
-	dd.DragStyle             = Enum.DragDetectorDragStyle.BestForDevice -- adapts to mouse or touch
-	dd.MaxForce              = Config.DragMaxForce                      -- cap the applied force
-	dd.MaxTorque             = Config.DragMaxTorque                     -- cap the applied torque
-	dd.MaxActivationDistance = Config.DragActivationDist                -- proximity requirement
+	local dd = Instance.new("DragDetector")  -- making the box draggable
+	dd.ResponseStyle = Enum.DragDetectorResponseStyle.Physical  -- making it feel like real physics
+	dd.DragStyle = Enum.DragDetectorDragStyle.BestForDevice -- works nicely on PC and phones
+	dd.MaxForce  = Config.DragMaxForce        -- how hard you can pull it
+	dd.MaxTorque = Config.DragMaxTorque      -- how much it can spin while dragging
+	dd.MaxActivationDistance = Config.DragActivationDist  -- how close you need to be to grab it
 
-	-- Constraint: lift the box above the cursor plane while dragging so it clears the floor.
+	-- lifting the box a bit while dragging so it doesn't get stuck in the floor
 	dd:AddConstraintFunction(1, function(proposed: CFrame): CFrame
-		return proposed + Vector3.new(0, Config.DragYOffset, 0)   -- shift the proposed CFrame upward
+		return proposed + Vector3.new(0, Config.DragYOffset, 0)
 	end)
 
-	-- Every frame while dragging: cut the drag if the player strays too far.
+	-- checking things while the player is moving the box
 	dd.DragContinue:Connect(function(player: Player)
-		local char = player.Character                              -- the player's character model
+		local char = player.Character                                              
 		if not char then return end
 
-		local hrp = char:FindFirstChild("HumanoidRootPart")       -- position reference
+		local hrp = char:FindFirstChild("HumanoidRootPart")  -- the player's body
 		if not hrp then return end
 
-		local dist = (box.PrimaryPart.Position - hrp.Position).Magnitude   -- current separation
-		
-		
-		
-		if dist > Config.DragDistanceLimit then   -- player has gone too far
-			dd.Enabled = false                    -- stop the drag immediately
-			task.wait()                           -- yield one frame so the engine processes the change
-			dd.Enabled = true                     -- re-enable for future drags
+		local dist = (box.PrimaryPart.Position - hrp.Position).Magnitude 
+
+		-- if the player walks too far away, force them to drop the box
+		if dist > Config.DragDistanceLimit then   
+			dd.Enabled = false       
+			task.wait() 
+			dd.Enabled = true     
 		end
 	end)
 
+	-- remember who picked up the box first
 	dd.DragStart:Connect(function(player: Player)
-		box:SetAttribute("PlacedBy", player.Name)   -- write a string attribute onto the model
+		box:SetAttribute("PlacedBy", player.Name)  
 	end)
+
+	-- when they let go, put the box in the main world space
 	dd.DragEnd:Once(function()
 		box.Parent = workspace 
 	end)
 
-	dd.Parent = box   -- attach the detector to the box model
+	dd.Parent = box  
 
-	return box   -- return the instance in case the caller needs a reference
+	return box  
 end
 
+-- this part makes sure there is always a box ready to be grabbed
 do
-	spawnBox()   -- spawn the first box when the script starts
+	spawnBox()  
 
-	-- Whenever a child is removed from the spawn folder, check if any boxes remain
-	
 	BoxSpawnModel.ChildRemoved:Connect(function()
 		local hasBox = false
 		for _, child in ipairs(BoxSpawnModel:GetChildren()) do
@@ -255,253 +221,243 @@ do
 			end
 		end
 
-		if not hasBox then   -- no boxes left
-			spawnBox()       -- create a new one
+		-- if the spawn area is empty, spawn a new one
+		if not hasBox then 
+			spawnBox()     
 		end
 	end)
 end
 
--- ─────────────────────────────────────────────────────────────
--- WORKBENCH CLASS
--- ─────────────────────────────────────────────────────────────
-
+-- Setting up the Workbench (where players put the box to open it)
 local Workbench   = {}
 Workbench.__index = Workbench
 
 function Workbench.new(model: Model)
-	local self = setmetatable({}, Workbench)   -- new instance backed by the Workbench prototype
+	local self = setmetatable({}, Workbench)
 
-	-- ── Model references ──────────────────────────────────────
-	self.Model    = model
-	self.PosBox   = model:WaitForChild("PosBox")    -- Attachment: the slot where the box snaps
-	self.ZoneBox  = model:WaitForChild("ZoneBox")   -- BasePart: the invisible trigger zone
+	-- getting all the parts of the workbench we need
+	self.Model = model
+	self.PosBox = model:WaitForChild("PosBox")
+	self.ZoneBox = model:WaitForChild("ZoneBox")
 
-	self.gui          = model:WaitForChild("Gui")
-	self.timerGui     = self.gui:WaitForChild("Timer")
-	self.TimerLabel   = self.timerGui:WaitForChild("Text")   -- TextLabel that shows the countdown
-	self.FinishGui    = self.gui:WaitForChild("Finish")      -- Frame/Label shown when the box opens
+	-- getting the UI stuff (texts, timers)
+	self.gui = model:WaitForChild("Gui")
+	self.timerGui = self.gui:WaitForChild("Timer")
+	self.TimerLabel = self.timerGui:WaitForChild("Text")
+	self.FinishGui = self.gui:WaitForChild("Finish") 
 
-	self.ParticlesOpen = model:WaitForChild("Particles"):WaitForChild("Open")  -- particle folder
+	self.ParticlesOpen = model:WaitForChild("Particles"):WaitForChild("Open")  
 
-	-- ── Runtime state ─────────────────────────────────────────
-	self._state         = State.Idle   -- always starts waiting for a box
-	self._box           = nil          -- the Model currently on the bench (nil when idle)
-	self._placer        = nil          -- Player who dragged the box here
-	self._timer         = 0            -- seconds left on the countdown
-	self._timerAcc      = 0            -- accumulator for the label refresh throttle
-	self._spawnAcc      = 0            -- accumulator for bubble spawn timing
-	self._bubbles       = {}           -- list of active bubble data tables
-	self._hbConn        = nil          -- the single Heartbeat connection (reconnected per Opening)
-	self._conns         = {}           -- all other RBXScriptConnections for this bench
+	-- basic setup when the workbench is created
+	self._state = State.Idle
+	self._box = nil 
+	self._placer = nil        
+	self._timer = 0         
+	self._timerAcc = 0      
+	self._spawnAcc = 0          
+	self._bubbles = {}          
+	self._hbConn = nil 
+	self._conns = {}
 
-	-- Initial GUI state
+	-- hiding things until we actually need them
 	self.FinishGui.Visible = false
-	self.TimerLabel.Text   = ""        -- nothing to show while idle
+	self.TimerLabel.Text   = ""
 
-	self:_listenForBox()   -- begin watching the zone for an incoming box
+	self:_listenForBox() -- wait for someone to put a box here
 
 	return self
 end
 
--- ─────────────────────────────────────────────────────────────
--- STATE: Idle helpers
--- ─────────────────────────────────────────────────────────────
-
--- Connects ZoneBox.Touched so we know when a box enters the trigger area.
+-- Waiting for a player to drop a box on the table
 function Workbench:_listenForBox()
 
-	
+	-- keeping track so the game doesn't trigger this a hundred times at once
 	local debounce = {}
 
 	local conn = self.ZoneBox.Touched:Connect(function(hit)
-		if self._state ~= State.Idle then return end   -- only accept boxes when idle
+		if self._state ~= State.Idle then return end  -- if we are already doing something, stop here
 
 		local parent = hit.Parent
-		if not parent or not CollectionService:HasTag(parent, "Box") then return end   -- ignore non-boxes
+		if not parent or not CollectionService:HasTag(parent, "Box") then return end   -- make sure it's actually a box
 
-		if debounce[parent] then return end   -- this model is already queued for processing
-		debounce[parent] = true               -- lock it immediately, before any yield
+		if debounce[parent] then return end  
+		debounce[parent] = true 
 
-		task.defer(function()           -- defer one frame so the physics position settles
-			self:_enterOpening(parent)  -- hand off to the Opening state
-			debounce[parent] = nil      -- release the lock after the state has been entered
+		-- wait a tiny bit and then start the opening process
+		task.defer(function() 
+			self:_enterOpening(parent)
+			debounce[parent] = nil 
 		end)
 	end)
 
-	table.insert(self._conns, conn)   -- track so Destroy() can clean up
+	table.insert(self._conns, conn) -- save this connection so we can turn it off later
 end
 
--- ─────────────────────────────────────────────────────────────
--- STATE: Opening
--- ─────────────────────────────────────────────────────────────
-
+-- what happens when the box is placed and starts opening
 function Workbench:_enterOpening(box: Model)
-	if self._state ~= State.Idle then return end   -- double-entry guard
+	if self._state ~= State.Idle then return end 
 
-	self._state    = State.Opening          -- flip the state flag
-	self._box      = box                    -- store which box we're working on
-	self._timer    = Config.OpenDuration    -- reset countdown to full length
+	-- setup the basic stuff for this box
+	self._state    = State.Opening 
+	self._box      = box 
+	self._timer    = Config.OpenDuration 
 	self._timerAcc = 0
 	self._spawnAcc = 0
-	table.clear(self._bubbles)              -- clear leftover bubble data from a previous round
+	table.clear(self._bubbles)
 
-	-- Disable the DragDetector so the player can't pull the box back mid-countdown.
+	-- stop the player from grabbing the box again
 	local dd = box:FindFirstChildOfClass("DragDetector")
 	if dd then dd.Enabled = false end
 
-	-- Stop all physics on the box so it doesn't slide off the workbench.
+	-- stop the box from moving, spinning, or flying away
 	local primary = box.PrimaryPart
-	primary.AssemblyLinearVelocity  = Vector3.zero   -- kill linear velocity
-	primary.AssemblyAngularVelocity = Vector3.zero   -- kill angular velocity
-	box:PivotTo(self.PosBox.WorldCFrame)             -- snap exactly to the slot CFrame
-	
+	primary.AssemblyLinearVelocity  = Vector3.zero
+	primary.AssemblyAngularVelocity = Vector3.zero
+	box:PivotTo(self.PosBox.WorldCFrame) -- snap it to the exact center of the table
+
+	-- wait a split second and glue it to the table completely
 	task.delay(.2,function()
 		if primary and primary.Parent then
 			primary.Anchored = true
 		end
 	end)
 
-	-- Read the PlacedBy attribute the DragDetector stamped when the player grabbed the box.
+	-- remember who put the box here
 	local placerName = box:GetAttribute("PlacedBy")
 	self._placer = if placerName then Players:FindFirstChild(placerName) else nil
 
-	-- Make the timer visible.
+	-- show the timer on the screen and play the nice particles
 	self.timerGui.Visible = true
 	self:_burstParticles(true)
 	self.TimerLabel.Text = tostring(math.ceil(self._timer))
 
-	
-	-- the countdown, the label refresh and the bubble spawn/update loop.
+	-- start a super fast loop to count down the time and move the bubbles
 	self._hbConn = RunService.Heartbeat:Connect(function(dt)
-		if self._state ~= State.Opening then return end   -- exit as soon as the state changes
+		if self._state ~= State.Opening then return end 
 
-		self:_tickTimer(dt)     -- advance and display the countdown
-		self:_tickBubbles(dt)   -- move existing bubbles and maybe spawn a new one
+		self:_tickTimer(dt)
+		self:_tickBubbles(dt) 
 	end)
 end
 
--- Advances the countdown each frame and triggers the Opened state at zero.
+-- doing the math to update the timer text
 function Workbench:_tickTimer(dt: number)
-	self._timer    -= dt     -- subtract elapsed time
-	self._timerAcc += dt     -- accumulate for throttled label update
+	self._timer    -= dt -- take away time
+	self._timerAcc += dt
 
-	if self._timerAcc >= Config.TimerUpdateRate then   -- only touch the GUI every TimerUpdateRate seconds
+	-- only update the screen text sometimes so it doesn't lag
+	if self._timerAcc >= Config.TimerUpdateRate then 
 		self._timerAcc = 0
-		local display = math.max(0, math.ceil(self._timer))   -- round up so we never flash a premature zero
-		self.TimerLabel.Text = tostring(display)              -- push the number to the screen
+		local display = math.max(0, math.ceil(self._timer)) -- make sure it never shows less than 0
+		self.TimerLabel.Text = tostring(display)
 	end
 
-	if self._timer <= 0 then    -- countdown finished
-		self:_enterOpened()     -- move to the next state
+	-- when time is up, open the box
+	if self._timer <= 0 then
+		self:_enterOpened()
 	end
 end
 
--- ─────────────────────────────────────────────────────────────
--- BUBBLES
--- All bubble logic lives on the Workbench instance so it can
--- read self.PosBox and call self:_reduceTimer() directly
--- ────────────────────────────────────────────────────────────
-
--- Called every frame while Opening. Moves existing bubbles and handles spawning
 function Workbench:_tickBubbles(dt: number)
-	self._spawnAcc += dt   -- track time since the last bubble was spawned
+	self._spawnAcc += dt
 
-	if self._spawnAcc >= Config.BubbleInterval then   -- enough time has passed for a new bubble
-		self._spawnAcc = 0                             -- reset the spawn accumulator
-		self:_spawnBubble()                            -- create one
+	if self._spawnAcc >= Config.BubbleInterval then
+		self._spawnAcc = 0
+		self:_spawnBubble() 
 	end
 
+	if #self._bubbles == 0 then return end -- if there are no bubbles, just stop here
 
-	
-	if #self._bubbles == 0 then return end
-
-	-- Update every live bubble this frame (backwards loop so removal is safe).
+	-- check all bubbles (we go backwards so we don't mess up the list when we delete one)
 	for i = #self._bubbles, 1, -1 do
 		local b = self._bubbles[i]
 
-		if not b.alive then                    -- already popped this frame
-			table.remove(self._bubbles, i)     -- clean up the dead entry
-			continue
-		end
-
-		b.age     += dt                               -- accumulate lifetime
-		b.wobbleT += dt * Config.BubbleWobbleSpeed   -- advance the wobble phase
-
-		if b.age >= b.lifespan then          -- exceeded its natural lifespan
-			self:_popBubble(b, false)        -- auto-pop without crediting a player
+		-- if it's already popped, delete it from the list
+		if not b.alive then 
 			table.remove(self._bubbles, i)
 			continue
 		end
 
-		-- Float upward with a sinusoidal side-to-side wobble using CFrame arithmetic.
-		-- Splitting into X/Z wobble components gives a gentle figure-eight drift.
-		local cf      = b.model:GetPivot()                             -- current world CFrame
+		b.age     += dt
+		b.wobbleT += dt * Config.BubbleWobbleSpeed 
 
-		local wobbleX = math.sin(b.wobbleT) * Config.BubbleWobbleAmp  -- left-right sway
-		local wobbleZ = math.cos(b.wobbleT) * Config.BubbleWobbleAmp  -- forward-back sway
+		-- if the bubble is too old, pop it automatically
+		if b.age >= b.lifespan then
+			self:_popBubble(b, false)
+			table.remove(self._bubbles, i)
+			continue
+		end
 
-		local delta = Vector3.new(                      -- displacement vector for this frame
-			wobbleX,                                    -- horizontal drift X
-			Config.BubbleFloatSpeed * dt,               -- upward movement scaled by delta time
-			wobbleZ                                     -- horizontal drift Z
+		local cf   = b.model:GetPivot() 
+
+		-- math to make the bubble shake left and right a little bit
+		local wobbleX = math.sin(b.wobbleT) * Config.BubbleWobbleAmp
+		local wobbleZ = math.cos(b.wobbleT) * Config.BubbleWobbleAmp
+
+		-- move the bubble up and add the shaking
+		local delta = Vector3.new(
+			wobbleX,
+			Config.BubbleFloatSpeed * dt, 
+			wobbleZ  
 		)
 
-		b.model:PivotTo(cf + delta)   -- apply the movement; CFrame + Vector3 shifts the position
+		b.model:PivotTo(cf + delta)  
 	end
 end
 
--- Spawns one bubble at a random position around the workbench slot.
+-- Making a new bubble pop up around the box
 function Workbench:_spawnBubble()
-	-- Convert a random angle and distance into a world position using polar coordinates.
-	-- This guarantees even distribution in a circle rather than a square region.
-	local angle  = math.random() * math.pi * 2                                                     -- full 360° in radians
-	local radius = math.sqrt(math.random()) * Config.BubbleSpawnRadius                             -- sqrt gives uniform disk distribution
-	local height = Config.BubbleSpawnYMin + math.random() * (Config.BubbleSpawnYMax - Config.BubbleSpawnYMin)  -- random height in range
 
-	local origin   = self.PosBox.WorldPosition   -- center of the spawn disk
-	local spawnPos = origin + Vector3.new(        -- offset from the center using polar → Cartesian
-		math.cos(angle) * radius,                 -- X component
-		height,                                   -- Y component (height above the slot)
-		math.sin(angle) * radius                  -- Z component
+	-- random math to pick a spot around the box for the bubble to spawn
+	local angle  = math.random() * math.pi * 2                                             
+	local radius = math.sqrt(math.random()) * Config.BubbleSpawnRadius                            
+	local height = Config.BubbleSpawnYMin + math.random() * (Config.BubbleSpawnYMax - Config.BubbleSpawnYMin) 
+
+	local origin   = self.PosBox.WorldPosition  
+	local spawnPos = origin + Vector3.new(
+		math.cos(angle) * radius,
+		height,
+		math.sin(angle) * radius
 	)
 
-	local model = popTemplate:Clone()            -- clone the bubble template
-	model:PivotTo(CFrame.new(spawnPos))          -- place it at the calculated position
-	model.Parent = workspace                     -- add to the world so it renders and is clickable
+	-- creating the actual bubble and putting it in the world
+	local model = popTemplate:Clone()
+	model:PivotTo(CFrame.new(spawnPos))
+	model.Parent = workspace
 
-	-- Give each bubble a random lifespan so they don't all disappear at once.
+	-- deciding how long this specific bubble will live before it pops by itself
 	local lifespan = Config.BubbleMinLife + math.random() * (Config.BubbleMaxLife - Config.BubbleMinLife)
 
+	-- saving all the info about this new bubble
 	local bubble = {
-		model    = model,                          -- the cloned Model instance
-		age      = 0,                              -- seconds this bubble has been alive
-		lifespan = lifespan,                       -- when it auto-pops
-		wobbleT  = math.random() * math.pi * 2,   -- random phase so bubbles don't all sway together
-		alive    = true,                           -- set to false once popped to skip future updates
+		model    = model,
+		age      = 0,
+		lifespan = lifespan, 
+		wobbleT  = math.random() * math.pi * 2, -- so they don't all shake the exact same way
+		alive    = true,
 	}
 
-	-- Wire the ClickDetector inside the model so players can pop bubbles manually.
+	-- checking if the player clicks on the bubble
 	local cd = model:FindFirstChildOfClass("ClickDetector")
 	if cd then
-		cd.MouseClick:Connect(function(_player: Player)   -- fires on the server when a player clicks
-			if not bubble.alive then return end           -- ignore clicks on already-popping bubbles
-			self:_popBubble(bubble, true)                 -- true = player triggered the pop
+		cd.MouseClick:Connect(function(_player: Player) 
+			if not bubble.alive then return end
+			self:_popBubble(bubble, true) -- true means the player clicked it
 		end)
 	end
 
-	table.insert(self._bubbles, bubble)   -- add to the active list so _tickBubbles updates it
+	table.insert(self._bubbles, bubble) -- add it to our list of bubbles
 end
 
--- Plays the pop animation and notifies the timer if it was a player click.
+-- Popping the bubble (either clicked by a player or it got too old)
 function Workbench:_popBubble(bubble, byPlayer: boolean)
-	if not bubble.alive then return end   -- guard: prevent double-pops on the same bubble
-	bubble.alive = false                  -- mark dead immediately before any yields
+	if not bubble.alive then return end  
+	bubble.alive = false                
 
 	local part = bubble.model.PrimaryPart or bubble.model:FindFirstChildOfClass("BasePart")
 
 	if part then
-		-- Scale up and fade out using TweenService.
-		-- EasingStyle.Back makes the scale overshoot slightly before snapping — feels like a real pop.
+		-- making a smooth animation to make the bubble grow and fade out
 		local info = TweenInfo.new(
 			Config.BubblePopDuration,
 			Enum.EasingStyle.Back,
@@ -509,72 +465,73 @@ function Workbench:_popBubble(bubble, byPlayer: boolean)
 		)
 
 		local tween = TweenService:Create(part, info, {
-			Size         = part.Size * Config.BubblePopScale,   -- grow to the pop size
-			Transparency = 1,                                   -- fade to fully transparent
+			Size         = part.Size * Config.BubblePopScale, 
+			Transparency = 1, -- make it invisible
 		})
 
-		tween:Play()   -- start the animation
+		tween:Play() 
 
-		-- Schedule the model's destruction just after the tween ends.
+		-- delete the bubble from the game right after the animation finishes
 		Debris:AddItem(bubble.model, Config.BubblePopDuration + 0.05)
 	else
-		bubble.model:Destroy()   -- no animatable part found; destroy immediately
+		bubble.model:Destroy()  
 	end
 
+	-- if the player actually clicked it, cut some time off the clock
 	if byPlayer then
-		self:_reduceTimer()   -- player earned a speed boost
+		self:_reduceTimer()  
 	end
 end
 
--- Subtracts BubbleClickReduction from the timer, clamped to the floor.
+-- Taking time off the clock when they click a bubble
 function Workbench:_reduceTimer()
+	-- making sure the timer never goes below the minimum limit we set in Config
 	self._timer = math.max(
-		Config.TimerFloor,                             -- never go below the floor
-		self._timer - Config.BubbleClickReduction      -- subtract the bonus
+		Config.TimerFloor,                            
+		self._timer - Config.BubbleClickReduction   
 	)
 end
 
--- Force-pops every remaining bubble without triggering the player callback.
--- Called during cleanup so nothing keeps floating after the state changes.
+-- Popping all leftovers bubbles at once
 function Workbench:_clearBubbles()
 	for i = #self._bubbles, 1, -1 do
-		self:_popBubble(self._bubbles[i], false)   -- pop without granting timer reduction
+		self:_popBubble(self._bubbles[i], false)   
 		table.remove(self._bubbles, i)
 	end
 end
 
--- ─────────────────────────────────────────────────────────────
--- STATE: Opened
--- ─────────────────────────────────────────────────────────────
-
+-- Time is up Let's open the box.
 function Workbench:_enterOpened()
-	if self._state ~= State.Opening then return end   -- guard against re-entry
+	if self._state ~= State.Opening then return end   
 
-	self._state = State.Opened   -- flip state before anything async happens
+	self._state = State.Opened  
 
-	if self._hbConn then          -- disconnect the Heartbeat so nothing keeps ticking
+	-- stop the countdown loop
+	if self._hbConn then       
 		self._hbConn:Disconnect()
 		self._hbConn = nil
 	end
 
-	self:_clearBubbles()                              -- pop all remaining bubbles
-	self:_burstParticles(false)
-	self.timerGui.Visible  = false                    -- hide the timer BillboardGui
-	self.FinishGui.Visible = true                     -- show the "opened!" banner
+	self:_clearBubbles()                          
+	self:_burstParticles(false) -- turn off the opening particles
+	self.timerGui.Visible  = false                
+	self.FinishGui.Visible = true                    
 
-	self:_animateBoxOpen(self._box, function()        -- play the box-open animation
-		self:_spawnReward()                           -- drop the reward after the animation
+	-- play the open animation and give the reward when it's done
+	self:_animateBoxOpen(self._box, function() 
+		self:_spawnReward()
 		if self._box then
-			self._box:Destroy()                       -- remove the opened box from the world
+			self._box:Destroy() -- delete the empty box
 			self._box = nil
 		end
 	end)
 
+	-- save the point for the player who put the box here
 	if self._placer then
-		recordBoxOpened(self._placer)   -- write to the DataStore for the player who placed the box
+		recordBoxOpened(self._placer) 
 	end
 
-	-- After RewardLifetime, return to Idle whether or not the reward was collected.
+	-- reset the workbench after a while if nobody takes the reward
 	task.delay(Config.RewardLifetime, function()
 		if self._state == State.Opened then
 			self.FinishGui.Visible = false
@@ -583,72 +540,77 @@ function Workbench:_enterOpened()
 	end)
 end
 
--- Scales the box up and fades it out, then calls onDone when the tween finishes.
-function Workbench:_animateBoxOpen(box: Model, onDone: () -> ())
-	if not box then onDone() return end   -- box already gone, skip straight to the callback
+
+function Workbench:_animateBoxOpen(box: Model, onDone: () -> ())-- Making the box grow and fade away when it opens
+	-- if the box got deleted or is missing its main part, just skip this and move on
+	if not box then onDone() return end  
 
 	local part = box.PrimaryPart
-	if not part then onDone() return end  -- no primary part to animate
+	if not part then onDone() return end 
 
+	-- setting up how the animation feels, 'Back' makes it do a cool little bounce
 	local info = TweenInfo.new(
 		Config.BoxOpenAnimTime,
-		Enum.EasingStyle.Back,            -- overshoot makes it feel like the box is bursting open
+		Enum.EasingStyle.Back,           
 		Enum.EasingDirection.Out
 	)
 
+	-- telling the game WHAT to animat,: make it bigger and fully invisible
 	local tween = TweenService:Create(part, info, {
-		Size         = part.Size * 1.6,   -- grow to 160% of the original size
-		Transparency = 1,                 -- fade out completely
+		Size         = part.Size * 1.6,   
+		Transparency = 1,                
 	})
 
-	tween:Play()
+	tween:Play() -- play the animation
 
-	tween.Completed:Once(function()   -- Once fires exactly one time and auto-disconnects
+	-- wait until the animation is 100% done, then tell the game to give the reward
+	tween.Completed:Once(function()   
 		onDone()
 	end)
 end
 
--- Picks a random reward from the pre-cached pool, places it above the slot, and adds a DragDetector
+-- Giving the player a random reward
 function Workbench:_spawnReward()
-	
-	if #rewardPool == 0 then return end   -- nothing to give
 
-	local chosen = rewardPool[math.random(1, #rewardPool)]   -- pick one at random
-	local reward = chosen:Clone()                             -- clone it so the original stays intact
+	if #rewardPool == 0 then return end   
 
-	-- Place the reward slightly above the slot so it doesn't clip into the workbench surface
-	local spawnCF = self.PosBox.WorldCFrame * CFrame.new(0, 2, 0)   -- 2 studs above the slot
+	-- pick a random item from the rewards folder
+	local chosen = rewardPool[math.random(1, #rewardPool)]   
+	local reward = chosen:Clone()                          
+
+	-- spawn it slightly above the table
+	local spawnCF = self.PosBox.WorldCFrame * CFrame.new(0, 2, 0)   
 	reward:PivotTo(spawnCF)
 	reward.Parent = workspace
 
-	CollectionService:AddTag(reward, "Reward")   -- tag it so any script can identify reward items
+	CollectionService:AddTag(reward, "Reward")   -- tag it so the game knows it's a reward item
 
-	-- Give the reward its own DragDetector so the player can pick it up and carry it away
+	-- make the reward grabbable too
 	local dd = Instance.new("DragDetector")
-	dd.ResponseStyle         = Enum.DragDetectorResponseStyle.Physical
-	dd.DragStyle             = Enum.DragDetectorDragStyle.BestForDevice
-	dd.MaxForce              = Config.RewardDragForce
-	dd.MaxTorque             = Config.RewardDragForce
-	dd.MaxActivationDistance = 20           -- player must be within 20 studs to start dragging
-	dd.Parent                = reward       -- attach to the reward model
+	dd.ResponseStyle = Enum.DragDetectorResponseStyle.Physical
+	dd.DragStyle = Enum.DragDetectorDragStyle.BestForDevice
+	dd.MaxForce = Config.RewardDragForce
+	dd.MaxTorque = Config.RewardDragForce
+	dd.MaxActivationDistance = 20           
+	dd.Parent = reward        
 
-	-- When the player drops the reward (drag ends), free the bench for the next box.
+	-- when they grab the reward, reset the workbench for the next player
 	dd.DragEnd:Connect(function()
 		if self._state == State.Opened then
 			self.FinishGui.Visible = false
-			self._state = State.Idle         -- bench is free again
+			self._state = State.Idle 
 		end
 	end)
 
-	-- Auto-despawn if no one picks it up within the lifetime window.
+	-- delete the reward if nobody picks it up after a while
 	task.delay(Config.RewardLifetime, function()
 		if reward and reward.Parent then
-			reward:Destroy()   -- remove it from the world
+			reward:Destroy()  
 		end
 	end)
 end
 
--- Enables or disables all ParticleEmitters in the Open folder.
+-- Turning the shiny particles on or off
 function Workbench:_burstParticles(visible)
 	for _, desc in ipairs(self.ParticlesOpen:GetDescendants()) do
 		if desc:IsA("ParticleEmitter") then
@@ -657,8 +619,7 @@ function Workbench:_burstParticles(visible)
 	end
 end
 
--- Disconnects all connections owned by this workbench instance.
--- Call this if you ever remove a workbench from the world at runtime.
+-- cleaning up everything if the workbench gets deleted
 function Workbench:Destroy()
 	if self._hbConn then
 		self._hbConn:Disconnect()
@@ -672,20 +633,17 @@ function Workbench:Destroy()
 	self:_clearBubbles()
 end
 
--- ─────────────────────────────────────────────────────────────
--- BOOT  —  create one Workbench instance per model in the folder
--- ─────────────────────────────────────────────────────────────
+-- setting up all the workbenches already in the map
+local benches = {}  
 
-local benches = {}   -- keep strong references so the instances are never garbage-collected
-
-for _, model in ipairs(WorkbenchFolder:GetChildren()) do   -- iterate every child in the folder
-	if model:IsA("Model") then                             -- skip any non-Model children
-		local bench = Workbench.new(model)                 -- build the state machine for this bench
-		table.insert(benches, bench)                       -- store the reference
+for _, model in ipairs(WorkbenchFolder:GetChildren()) do 
+	if model:IsA("Model") then                          
+		local bench = Workbench.new(model)                
+		table.insert(benches, bench)                    
 	end
 end
 
--- If workbenches are added to the folder after the script starts, handle them automatically.
+-- setting up any new workbenches added to the map later
 WorkbenchFolder.ChildAdded:Connect(function(child)
 	if child:IsA("Model") then
 		local bench = Workbench.new(child)
