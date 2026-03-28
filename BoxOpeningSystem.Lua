@@ -113,31 +113,35 @@ local function recordBoxOpened(player: Player)
 		end
 	end
 
-	-- quickly save the new score to the database right now, just to be safe
-	pcall(function()
-		BoxStore:UpdateAsync(session.key, function()
-			return { boxesOpened = session.boxesOpened }
-		end)
-	end)
 
-	session.dirty = false -- score is saved, so it's not 'dirty' anymore
 end
+
 
 -- Saving player stuff when they leave the game
 local function saveSession(player: Player)
 	local session = sessions[player.UserId] 
-	if not session then return end   
+	if not session or not session.dirty then return end   
 
-	-- only save if their score actually changed, so we don't spam the database for nothing
-	if session.dirty then  
-		pcall(function()
-			BoxStore:UpdateAsync(session.key, function()
-				return { boxesOpened = session.boxesOpened } 
-			end)
+	local success, errorMessage = pcall(function()
+		BoxStore:UpdateAsync(session.key, function(oldValue)
+			
+			if oldValue and type(oldValue) == "table" then
+			
+				if oldValue.boxesOpened > session.boxesOpened then
+					return nil -- cancels the update
+				end
+			end
+
+		
+			return { boxesOpened = session.boxesOpened } 
 		end)
+	end)
+
+	if not success then
+		warn(`[DataStore] Failed to save data for {player.Name}: {errorMessage}`)
 	end
 
-	sessions[player.UserId] = nil -- remove their info from the local list since they left
+	sessions[player.UserId] = nil  -- remove their info from the local list since they left
 end
 
 -- whenever someone joins, load their stuff
@@ -180,16 +184,19 @@ local function spawnBox()
 		local char = player.Character                                              
 		if not char then return end
 
-		local hrp = char:FindFirstChild("HumanoidRootPart")  -- the player's body
+		local hrp = char:FindFirstChild("HumanoidRootPart") 
 		if not hrp then return end
 
 		local dist = (box.PrimaryPart.Position - hrp.Position).Magnitude 
 
-		-- if the player walks too far away, force them to drop the box
+		-- disconnect and schedule reconnection without pausing (yielding) the current thread
 		if dist > Config.DragDistanceLimit then   
-			dd.Enabled = false       
-			task.wait() 
-			dd.Enabled = true     
+			dd.Enabled = false
+
+			-- task.defer the function runs on the exact next free cycle of the motor, without locking the current code
+			task.defer(function()
+				dd.Enabled = true     
+			end)
 		end
 	end)
 
@@ -212,19 +219,18 @@ end
 do
 	spawnBox()  
 
-	BoxSpawnModel.ChildRemoved:Connect(function()
-		local hasBox = false
-		for _, child in ipairs(BoxSpawnModel:GetChildren()) do
-			if CollectionService:HasTag(child, "Box") then
-				hasBox = true
-				break
-			end
-		end
+	
+	BoxSpawnModel.ChildRemoved:Connect(function(child)
+		-- if what was removed was a tagged box
+		if not CollectionService:HasTag(child, "Box") then return end
 
+	
 		-- if the spawn area is empty, spawn a new one
-		if not hasBox then 
-			spawnBox()     
-		end
+		task.defer(function()
+			if not BoxSpawnModel:FindFirstChildWhichIsA("Model") then
+				spawnBox()
+			end
+		end)
 	end)
 end
 
@@ -247,6 +253,11 @@ function Workbench.new(model: Model)
 	self.FinishGui = self.gui:WaitForChild("Finish") 
 
 	self.ParticlesOpen = model:WaitForChild("Particles"):WaitForChild("Open")  
+	
+	-- when the model is destroyed, we need to clean up
+	model.Destroying:Connect(function()
+		self:Destroy()
+	end)
 
 	-- basic setup when the workbench is created
 	self._state = State.Idle
@@ -310,7 +321,10 @@ function Workbench:_enterOpening(box: Model)
 	if dd then dd.Enabled = false end
 
 	-- stop the box from moving, spinning, or flying away
+	
 	local primary = box.PrimaryPart
+	if not primary then return end
+	
 	primary.AssemblyLinearVelocity  = Vector3.zero
 	primary.AssemblyAngularVelocity = Vector3.zero
 	box:PivotTo(self.PosBox.WorldCFrame) -- snap it to the exact center of the table
@@ -358,62 +372,27 @@ function Workbench:_tickTimer(dt: number)
 	end
 end
 
+-- moving the bubbles around the box
 function Workbench:_tickBubbles(dt: number)
 	self._spawnAcc += dt
 
 	if self._spawnAcc >= Config.BubbleInterval then
 		self._spawnAcc = 0
-		self:_spawnBubble() 
+		self:_spawnBubble()
 	end
 
-	if #self._bubbles == 0 then return end -- if there are no bubbles, just stop here
 
-	-- check all bubbles (we go backwards so we don't mess up the list when we delete one)
-	for i = #self._bubbles, 1, -1 do
-		local b = self._bubbles[i]
-
-		-- if it's already popped, delete it from the list
-		if not b.alive then 
-			table.remove(self._bubbles, i)
-			continue
-		end
-
-		b.age     += dt
-		b.wobbleT += dt * Config.BubbleWobbleSpeed 
-
-		-- if the bubble is too old, pop it automatically
-		if b.age >= b.lifespan then
-			self:_popBubble(b, false)
-			table.remove(self._bubbles, i)
-			continue
-		end
-
-		local cf   = b.model:GetPivot() 
-
-		-- math to make the bubble shake left and right a little bit
-		local wobbleX = math.sin(b.wobbleT) * Config.BubbleWobbleAmp
-		local wobbleZ = math.cos(b.wobbleT) * Config.BubbleWobbleAmp
-
-		-- move the bubble up and add the shaking
-		local delta = Vector3.new(
-			wobbleX,
-			Config.BubbleFloatSpeed * dt, 
-			wobbleZ  
-		)
-
-		b.model:PivotTo(cf + delta)  
-	end
 end
 
--- Making a new bubble pop up around the box
+-- making a new bubble pop up around the box
 function Workbench:_spawnBubble()
 
 	-- random math to pick a spot around the box for the bubble to spawn
-	local angle  = math.random() * math.pi * 2                                             
-	local radius = math.sqrt(math.random()) * Config.BubbleSpawnRadius                            
-	local height = Config.BubbleSpawnYMin + math.random() * (Config.BubbleSpawnYMax - Config.BubbleSpawnYMin) 
+	local angle= math.random() * math.pi * 2
+	local radius = math.sqrt(math.random()) * Config.BubbleSpawnRadius
+	local height = Config.BubbleSpawnYMin + math.random() * (Config.BubbleSpawnYMax - Config.BubbleSpawnYMin)
 
-	local origin   = self.PosBox.WorldPosition  
+	local origin= self.PosBox.WorldPosition
 	local spawnPos = origin + Vector3.new(
 		math.cos(angle) * radius,
 		height,
@@ -425,28 +404,57 @@ function Workbench:_spawnBubble()
 	model:PivotTo(CFrame.new(spawnPos))
 	model.Parent = workspace
 
-	-- deciding how long this specific bubble will live before it pops by itself
+	-- will live before it pops by itself
 	local lifespan = Config.BubbleMinLife + math.random() * (Config.BubbleMaxLife - Config.BubbleMinLife)
 
 	-- saving all the info about this new bubble
 	local bubble = {
-		model    = model,
-		age      = 0,
-		lifespan = lifespan, 
-		wobbleT  = math.random() * math.pi * 2, -- so they don't all shake the exact same way
-		alive    = true,
+		model= model,
+		alive= true,
+		
 	}
 
 	-- checking if the player clicks on the bubble
 	local cd = model:FindFirstChildOfClass("ClickDetector")
 	if cd then
-		cd.MouseClick:Connect(function(_player: Player) 
+		cd.MouseClick:Connect(function(_player: Player)
 			if not bubble.alive then return end
 			self:_popBubble(bubble, true) -- true means the player clicked it
 		end)
 	end
 
 	table.insert(self._bubbles, bubble) -- add it to our list of bubbles
+
+
+	-- create a random drift to fake a wobble effect without lagging the network
+	local primaryPart = model.PrimaryPart or model:FindFirstChildOfClass("BasePart")
+
+	if primaryPart then
+		-- random drift instead of a perfect sine wave so it looks organic
+		local driftX = (math.random() - 0.5) * (Config.BubbleWobbleAmp * 15)
+		local driftZ = (math.random() - 0.5) * (Config.BubbleWobbleAmp * 15)
+
+		-- where the bubble should end up before it pops
+		local endPos = spawnPos + Vector3.new(
+			driftX, 
+			Config.BubbleFloatSpeed * lifespan, 
+			driftZ
+		)
+
+		local moveInfo = TweenInfo.new(lifespan, Enum.EasingStyle.Linear)
+		local moveTween = TweenService:Create(primaryPart, moveInfo, {
+			CFrame = CFrame.new(endPos)
+		})
+
+		moveTween:Play()
+	end
+
+	-- automatically pop the bubble when its lifespan is over 
+	task.delay(lifespan, function()
+		if bubble.alive then
+			self:_popBubble(bubble, false)
+		end
+	end)
 end
 
 -- Popping the bubble (either clicked by a player or it got too old)
@@ -454,7 +462,7 @@ function Workbench:_popBubble(bubble, byPlayer: boolean)
 	if not bubble.alive then return end  
 	bubble.alive = false                
 
-	local part = bubble.model.PrimaryPart or bubble.model:FindFirstChildOfClass("BasePart")
+	local part = bubble.model.PrimaryPart and bubble.model.PrimaryPart or bubble.model:FindFirstChildOfClass("BasePart")
 
 	if part then
 		-- making a smooth animation to make the bubble grow and fade out
@@ -555,7 +563,7 @@ function Workbench:_animateBoxOpen(box: Model, onDone: () -> ())-- Making the bo
 		Enum.EasingDirection.Out
 	)
 
-	-- telling the game WHAT to animat,: make it bigger and fully invisible
+	-- telling the game WHAT to animat, make it bigger and fully invisible
 	local tween = TweenService:Create(part, info, {
 		Size         = part.Size * 1.6,   
 		Transparency = 1,                
@@ -569,7 +577,7 @@ function Workbench:_animateBoxOpen(box: Model, onDone: () -> ())-- Making the bo
 	end)
 end
 
--- Giving the player a random reward
+-- giving the player a random reward
 function Workbench:_spawnReward()
 
 	if #rewardPool == 0 then return end   
@@ -621,14 +629,8 @@ end
 
 -- cleaning up everything if the workbench gets deleted
 function Workbench:Destroy()
-	if self._hbConn then
-		self._hbConn:Disconnect()
-	end
-
-	for _, conn in ipairs(self._conns) do
-		conn:Disconnect()
-	end
-
+	if self._hbConn then self._hbConn:Disconnect() end
+	for _, conn in ipairs(self._conns) do conn:Disconnect() end
 	table.clear(self._conns)
 	self:_clearBubbles()
 end
@@ -649,4 +651,17 @@ WorkbenchFolder.ChildAdded:Connect(function(child)
 		local bench = Workbench.new(child)
 		table.insert(benches, bench)
 	end
+end)
+
+
+-- protect data when the server is shutting down
+game:BindToClose(function()
+	for _, player in ipairs(Players:GetPlayers()) do
+		task.spawn(function()
+			saveSession(player)
+		end)
+	end
+
+	-- give the datastore a moment to finish
+	task.wait(3)
 end)
