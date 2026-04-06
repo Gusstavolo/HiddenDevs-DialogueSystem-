@@ -1,5 +1,4 @@
 
-
 local Players = game:GetService("Players") -- gets the Players service to manage player objects
 local RunService = game:GetService("RunService") -- gets the RunService to check game loops and ticks
 local TweenService = game:GetService("TweenService") -- gets the TweenService for smooth animations
@@ -34,7 +33,7 @@ local Config = { -- creates a table to hold all the game settings
 	DragMaxTorque = 50000, -- sets how much it can spin while dragging
 	DragActivationDist = 15, -- sets how close the player needs to be to grab it
 	DragDistanceLimit = 20, -- sets distance limit to drop the box if walked too far away
-	DragYOffset = 5, -- sets how high the box lifts off the floor while dragging
+	DragYOffset = 3, -- sets how high the box lifts off the floor while dragging
 
 	OpenDuration = 18.0, -- sets the normal time it takes to open a box
 	TimerFloor = 4.0, -- sets the minimum time limit (can't open instantly)
@@ -143,7 +142,6 @@ end
 Players.PlayerAdded:Connect(function(player) task.spawn(loadSession, player) end) -- connects to when a player joins
 Players.PlayerRemoving:Connect(saveSession) -- connects to when a player leaves
 for _, p in ipairs(Players:GetPlayers()) do task.spawn(loadSession, p) end -- loads data for players already in game (Studio testing)
-
 local function spawnBox() -- function to create a new draggable box
 	local box = boxTemplate:Clone() -- clones the box template
 	box.Parent = BoxSpawnModel -- parents the new box to the spawn area
@@ -157,9 +155,17 @@ local function spawnBox() -- function to create a new draggable box
 	dd.MaxForce = Config.DragMaxForce -- applies the config max force
 	dd.MaxTorque = Config.DragMaxTorque -- applies the config max torque
 	dd.MaxActivationDistance = Config.DragActivationDist -- applies the config activation distance
+	dd.Responsiveness = 10 -- lowers responsiveness slightly to avoid crazy fling speeds
 
-	dd:AddConstraintFunction(1, function(proposed: CFrame): CFrame -- adds a constraint to lift the box while dragging
-		return proposed + Vector3.new(0, Config.DragYOffset, 0) -- pushes the box up slightly
+	dd:AddConstraintFunction(1, function(proposed: CFrame): CFrame -- adds a constraint to handle dragging behavior
+		local newPos = proposed.Position -- gets the proposed position from the mouse
+		local floorY = spawnAnchor.Position.Y -- gets the floor level from the spawn anchor
+
+		if newPos.Y < floorY then -- checks if mouse is pointing under the floor
+			newPos = Vector3.new(newPos.X, floorY, newPos.Z) -- forces the position to stay above the floor to prevent physics flinging
+		end
+
+		return CFrame.new(newPos) * proposed.Rotation + Vector3.new(0, Config.DragYOffset, 0) -- returns the safe position with the float offset
 	end)
 
 	dd.DragContinue:Connect(function(player: Player) -- connects to while the player is dragging
@@ -171,6 +177,8 @@ local function spawnBox() -- function to create a new draggable box
 		if not hrp or not primary then return end -- exits if missing parts
 
 		if (primary.Position - hrp.Position).Magnitude > Config.DragDistanceLimit then -- checks if player walked too far
+			primary.AssemblyLinearVelocity = Vector3.zero -- stops box movement immediately to prevent flinging
+			primary.AssemblyAngularVelocity = Vector3.zero -- stops box spinning
 			dd.Enabled = false -- disables the drag detector
 			task.defer(function() dd.Enabled = true end) -- enables it again safely on the next frame
 		end
@@ -178,10 +186,33 @@ local function spawnBox() -- function to create a new draggable box
 
 	dd.DragStart:Connect(function(player: Player) -- connects to when the drag starts
 		box:SetAttribute("PlacedBy", player.UserId) -- remembers the user ID of who grabbed it
+
+		local char = player.Character -- gets the player's character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart") :: BasePart? -- finds the HumanoidRootPart
+
+		if hrp then -- checks if the player has a root part
+			dd.ReferenceInstance = hrp -- sets the drag limits to be relative to the player's body
+			local limit = Config.DragDistanceLimit - 10 -- creates a safe bounding limit just under the max distance
+
+			-- sets a native invisible box around the player so the mouse can never pull it to the infinite
+			dd.MinDragTranslation = Vector3.new(-limit, -40, -limit) -- limits left and back (Y is infinite so floor constraint handles it)
+			dd.MaxDragTranslation = Vector3.new(limit, 40, limit) -- limits right and forward
+		end
 	end)
 
 	dd.DragEnd:Once(function() -- connects once to when the player lets go of the box
 		box.Parent = workspace -- moves the box to the main workspace
+
+		dd.ReferenceInstance = nil -- removes the player as the reference
+		dd.MinDragTranslation = Vector3.new(-math.huge, -math.huge, -math.huge) -- resets the minimum limits back to default
+		dd.MaxDragTranslation = Vector3.new(math.huge, math.huge, math.huge) -- resets the maximum limits back to default
+
+		local primary = box.PrimaryPart -- gets the primary part of the box
+		if primary then -- checks if part exists
+			primary.AssemblyLinearVelocity = Vector3.zero -- zeroes out speed to prevent sliding/flinging after dropping
+			primary.AssemblyAngularVelocity = Vector3.zero -- zeroes out spinning
+		end
+
 		spawnBox() -- spawns a new box right away
 	end)
 
@@ -389,7 +420,11 @@ function Workbench:_popBubble(bubble: Bubble, byPlayer: boolean) -- function to 
 end
 
 function Workbench:_reduceTimer() -- function to shave time off the clock
-	self._timer = math.max(Config.TimerFloor, self._timer - Config.BubbleClickReduction) -- reduces time safely without going below floor
+	if self._timer > Config.TimerFloor then -- checks if timer is currently above the floor limit
+		self._timer = math.max(Config.TimerFloor, self._timer - Config.BubbleClickReduction) -- reduces time safely without dropping below floor
+	else -- if timer is already at or below the floor
+		self._timer = math.max(0, self._timer - Config.BubbleClickReduction) -- reduces time normally towards zero
+	end
 end
 
 function Workbench:_clearBubbles() -- function to pop all leftover bubbles
