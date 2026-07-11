@@ -1,4 +1,4 @@
-Discord : gusstavolo#488366741366243360 or Gusss#0715 / Roblox : @TheLogg or 451103818
+--Discord : gusstavolo#488366741366243360 or Gusss#0715 / Roblox : @TheLogg or 451103818
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
