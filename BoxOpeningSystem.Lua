@@ -101,14 +101,14 @@ local function loadSession(player: Player)
 	-- Instance lifecycle optimization: we define and configure all properties 
 	-- before setting the Parent. This avoids unnecessary replication updates and 
 	-- UI recalculation events during initialization.
-	local leaderstats = Instance.new("Folder")
+	local leaderstats = Instance.new("Folder",player)
 	leaderstats.Name = "leaderstats"
-	leaderstats.Parent = player
 
-	local boxesValue = Instance.new("IntValue")
+
+	local boxesValue = Instance.new("IntValue",leaderstats)
 	boxesValue.Name = "Boxes Opened"
 	boxesValue.Value = count
-	boxesValue.Parent = leaderstats
+	
 end
 
 local function recordBoxOpened(player: Player)
@@ -199,7 +199,7 @@ local function spawnBox()
 
 	CollectionService:AddTag(box, "Box")
 
-	local dd = Instance.new("DragDetector")
+	local dd = Instance.new("DragDetector", box)
 	dd.ResponseStyle = Enum.DragDetectorResponseStyle.Physical
 	dd.DragStyle = Enum.DragDetectorDragStyle.BestForDevice
 	dd.MaxForce = Config.DragMaxForce
@@ -292,7 +292,6 @@ local function spawnBox()
 		spawnBox()
 	end)
 
-	dd.Parent = box
 	return box
 end
 
@@ -669,7 +668,7 @@ function Workbench:_spawnReward()
 
 	-- Correct and non-deprecated property initialization pattern:
 	-- Instantiating parent-less, setting properties, and then parenting.
-	local dd = Instance.new("DragDetector")
+	local dd = Instance.new("DragDetector",reward)
 	dd.ResponseStyle = Enum.DragDetectorResponseStyle.Physical
 	dd.DragStyle = Enum.DragDetectorDragStyle.BestForDevice
 	dd.MaxForce = Config.RewardDragForce
@@ -744,7 +743,7 @@ function Workbench:_spawnReward()
 		end
 	end)
 
-	dd.Parent = reward
+
 
 	task.delay(Config.RewardLifetime, function()
 		if reward and reward.Parent then
