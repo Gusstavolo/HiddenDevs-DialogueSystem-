@@ -30,10 +30,10 @@ type Bubble = {
 }
 
 --[[
- Central tuning table for the whole system. Keeping every magic number
- here (instead of scattered through the code) means gameplay balance
- can be adjusted without touching logic, and makes it obvious which
- values are related ( all Bubble* fields control the same mechanic)
+	Central tuning table for the whole system. Keeping every magic number
+	here (instead of scattered through the code) means gameplay balance
+	can be adjusted without touching logic, and makes it obvious which
+	values are related (all Bubble* fields control the same mechanic).
 ]]
 local Config = {
 	DragMaxForce = 50000,
@@ -76,10 +76,10 @@ local BoxStore = DataStoreService:GetDataStore(Config.DataStoreName)
 local sessions: { [number]: Session } = {}
 
 --[[
- Loads a player's saved box count when they join.
- Runs inside pcall because DataStore calls can fail (throttling, outage),
- and a failure here should never crash the join flow, worst case the
- player starts at 0 and we just don't have last session's cloud value yet
+	Loads a player's saved box count when they join.
+	Runs inside a pcall because DataStore calls are external web requests and can fail 
+	(throttling, service outage). A failure here should never crash the join flow; 
+	worst case, the player starts at 0 and we just don't have last session's cloud value.
 ]]
 local function loadSession(player: Player)
 	local key = "player_" .. tostring(player.UserId)
@@ -98,6 +98,9 @@ local function loadSession(player: Player)
 		dirty = false,
 	}
 
+	-- Instance lifecycle optimization: we define and configure all properties 
+	-- before setting the Parent. This avoids unnecessary replication updates and 
+	-- UI recalculation events during initialization.
 	local leaderstats = Instance.new("Folder")
 	leaderstats.Name = "leaderstats"
 	leaderstats.Parent = player
@@ -110,13 +113,17 @@ end
 
 local function recordBoxOpened(player: Player)
 	local session = sessions[player.UserId]
-	if not session then return end
+	if not session then
+		return
+	end
 
 	session.boxesOpened += 1
 	session.dirty = true
 
 	local leaderstats = player:FindFirstChild("leaderstats")
-	if not leaderstats then return end
+	if not leaderstats then
+		return
+	end
 
 	local boxesValue = leaderstats:FindFirstChild("Boxes Opened") :: IntValue?
 	if boxesValue then
@@ -125,17 +132,20 @@ local function recordBoxOpened(player: Player)
 end
 
 --[[
- Saves the player's session back to the DataStore on leave/server close
- Uses UpdateAsync instead of SetAsync because two servers could theoretically
- hold data for the same player (rejoining fast, or a rare race condition on
- shutdown): comparing oldValue.boxesOpened against the local session stops
- an outdated session from overwriting a higher value already saved by
- another server. Retries a few times since datastore calls occasionally
- fail transiently, then gives up and warns instead of retrying forever
+	Saves the player's session back to the DataStore on leave/server close.
+	Uses UpdateAsync instead of SetAsync because two servers could theoretically
+	hold data for the same player (rejoining fast, or a rare race condition on shutdown).
+	Comparing oldValue against the local session stops an outdated session from 
+	overwriting a higher value already saved by another server.
+	
+	Includes a progressive backoff retry strategy to prevent spamming the DataStore APIs
+	if the service is temporarily rate-limiting or experiencing transient failures.
 ]]
 local function saveSession(player: Player)
 	local session = sessions[player.UserId]
-	if not session or not session.dirty then return end
+	if not session or not session.dirty then
+		return
+	end
 
 	local success = false
 	local errorMessage
@@ -150,8 +160,13 @@ local function saveSession(player: Player)
 			end)
 		end)
 
-		if success then break end
-		task.wait(2)
+		if success then
+			break
+		end
+
+		-- Progressive backoff: waiting longer with each failed attempt 
+		-- to allow internal service limits to cool down before retrying.
+		task.wait(attempt * 1.5)
 	end
 
 	if not success then
@@ -161,15 +176,21 @@ local function saveSession(player: Player)
 	sessions[player.UserId] = nil
 end
 
-Players.PlayerAdded:Connect(function(player) task.spawn(loadSession, player) end)
+Players.PlayerAdded:Connect(function(player)
+	task.spawn(loadSession, player)
+end)
+
 Players.PlayerRemoving:Connect(saveSession)
-for _, p in ipairs(Players:GetPlayers()) do task.spawn(loadSession, p) end
+
+for _, p in ipairs(Players:GetPlayers()) do
+	task.spawn(loadSession, p)
+end
 
 --[[
- Creates a new draggable box at the spawn point and wires up its
- DragDetector, spawnBox calls itself again inside DragEnd so there is
- always exactly one box available to grab, without needing a separate
- spawner loop running in the background
+	Creates a new draggable box at the spawn point and wires up its DragDetector.
+	Using a tail-recursive call structure inside DragEnd ensures that there is
+	always exactly one active box in the physical space without having to run
+	an intensive game loop watching the box counts.
 ]]
 local function spawnBox()
 	local box = boxTemplate:Clone()
@@ -188,13 +209,12 @@ local function spawnBox()
 	dd.Responsiveness = 10
 
 	--[[
-	 Constrains the drag target so the box can never be pulled below the
-	 spawn floor or flung to extreme positions. Physical DragDetectors apply
-	 force toward the proposed CFrame every frame, without this clamp, a
-	 player aiming their mouse under the floor (or off the edge of the map)
-	 would cause the physics solver to fling the box at high velocity trying
-	 to reach an unreachable target, the Y offset keeps the box floating
-	 slightly above the surface it's dragged over
+		Constrains the drag target so the box can never be pulled below the
+		spawn floor or flung to extreme positions. Physical DragDetectors apply
+		force toward the proposed CFrame every frame. Without this clamp, a
+		player aiming their mouse under the floor or off the edge of the map
+		would cause the physics solver to fling the box at high velocity, risking
+		severe positional desync.
 	]]
 	dd:AddConstraintFunction(1, function(proposed: CFrame): CFrame
 		local newPos = proposed.Position
@@ -208,31 +228,38 @@ local function spawnBox()
 	end)
 
 	--[[
-	 Force-stops the box if the dragging player walks too far away,
-	 Toggling Enabled off then back on next frame (instead of just zeroing
-	 velocity) fully resets the DragDetector's internal target, preventing
-	 it from immediately re-accelerating the box back toward the player.
+		Force-stops the box if the dragging player walks too far away.
+		Toggling Enabled off then back on next frame via task.defer (instead of 
+		just zeroing velocity) fully resets the DragDetector's internal solver target,
+		preventing it from immediately re-accelerating the box back toward the player 
+		once they return into range.
 	]]
 	dd.DragContinue:Connect(function(player: Player)
 		local char = player.Character
-		if not char then return end
+		if not char then
+			return
+		end
 
 		local hrp = char:FindFirstChild("HumanoidRootPart") :: BasePart?
 		local primary = box.PrimaryPart
-		if not hrp or not primary then return end
+		if not hrp or not primary then
+			return
+		end
 
 		if (primary.Position - hrp.Position).Magnitude > Config.DragDistanceLimit then
 			primary.AssemblyLinearVelocity = Vector3.zero
 			primary.AssemblyAngularVelocity = Vector3.zero
 			dd.Enabled = false
-			task.defer(function() dd.Enabled = true end)
+			task.defer(function()
+				dd.Enabled = true
+			end)
 		end
 	end)
 
 	--[[
-	 Anchors the drag limits to the player's HumanoidRootPart instead of
-	 world space, so the box stays within a fixed radius of whoever is
-	 holding it no matter where on the map they are standing.
+		Anchors the drag limits to the player's HumanoidRootPart instead of world space.
+		This ensures that the box stays within a local bounding circle around whoever
+		is holding it, preventing players from manipulating boxes across the map.
 	]]
 	dd.DragStart:Connect(function(player: Player)
 		box:SetAttribute("PlacedBy", player.UserId)
@@ -275,13 +302,14 @@ local Workbench = {}
 Workbench.__index = Workbench
 
 --[[
- Workbench represents a single opening station in the map.
- Each instance tracks its own state (Idle -> Opening -> Opened) so multiple
- players can open boxes at different tables simultaneously without shared
- state bugs, the class owns all connections tied to its lifetime (heartbeat
- loop, touch detection, bubble tracking) and disconnects them in Destroy,
- which is important since workbenches can be added/removed at runtime via
- WorkbenchFolder.ChildAdded and model.Destroying
+	Workbench represents a single opening station in the map.
+	Each instance tracks its own state (Idle -> Opening -> Opened) using an OOP structure,
+	guaranteeing that multiple players can open boxes at different tables simultaneously
+	without shared-state conflicts. 
+	
+	The class encapsulates and tracks its own hardware events, heartbeat connections, 
+	and physical entities, cleaning them up systematically inside :Destroy() to avoid 
+	memory leaks in long-running server environments.
 ]]
 function Workbench.new(model: Model)
 	local self = setmetatable({}, Workbench)
@@ -320,20 +348,28 @@ function Workbench.new(model: Model)
 end
 
 --[[
- Listens for a box touching this workbench's zone, The debounce table
- keys off the box instance itself rather than a boolean, since Touched
- can fire multiple times per physical contact and we only want to
- trigger the opening sequence once per box
+	Listens for a box touching this workbench's zone.
+	The debounce table maps directly to the box Instance rather than a standard boolean.
+	Since the Touched event can fire dozens of times per single physics collision,
+	indexing by the instance guarantees that we trigger the transition logic exactly
+	once per box, avoiding race conditions if multiple boxes hit the zone at once.
 ]]
 function Workbench:_listenForBox()
 	local debounce = {}
 
 	local conn = self.ZoneBox.Touched:Connect(function(hit)
-		if self._state ~= State.Idle then return end
+		if self._state ~= State.Idle then
+			return
+		end
 
 		local parent = hit.Parent
-		if not parent or not CollectionService:HasTag(parent, "Box") then return end
-		if debounce[parent] then return end
+		if not parent or not CollectionService:HasTag(parent, "Box") then
+			return
+		end
+
+		if debounce[parent] then
+			return
+		end
 
 		debounce[parent] = true
 
@@ -347,16 +383,21 @@ function Workbench:_listenForBox()
 end
 
 --[[
- Transitions the workbench into the Opening state. The box is anchored
- after a short delay instead of immediately, giving the physics engine
- a frame to settle the box's velocity from being dropped/pivoted before
- locking it in place, avoiding a visible snap or jitter
+	Transitions the workbench into the Opening state.
+	The box's anchoring is deferred by 0.2 seconds instead of anchoring immediately.
+	This brief pause allows the physics solver a few frames to resolve any residual
+	moments of inertia or angular velocity from being dropped, preventing the box
+	from instantly snapping and clipping into the table model in a jarring way.
 ]]
 function Workbench:_enterOpening(box: Model)
-	if self._state ~= State.Idle then return end
+	if self._state ~= State.Idle then
+		return
+	end
 
 	local primary = box.PrimaryPart
-	if not primary then return end
+	if not primary then
+		return
+	end
 
 	self._state = State.Opening
 	self._box = box
@@ -366,7 +407,9 @@ function Workbench:_enterOpening(box: Model)
 	table.clear(self._bubbles)
 
 	local dd = box:FindFirstChildOfClass("DragDetector")
-	if dd then dd.Enabled = false end
+	if dd then
+		dd.Enabled = false
+	end
 
 	primary.AssemblyLinearVelocity = Vector3.zero
 	primary.AssemblyAngularVelocity = Vector3.zero
@@ -379,14 +422,23 @@ function Workbench:_enterOpening(box: Model)
 	end)
 
 	local placerId = box:GetAttribute("PlacedBy")
-	self._placer = if placerId then Players:GetPlayerByUserId(placerId) else nil
+	if placerId then
+		self._placer = Players:GetPlayerByUserId(placerId)
+	else
+		self._placer = nil
+	end
 
 	self.timerGui.Visible = true
 	self:_burstParticles(true)
 	self.TimerLabel.Text = tostring(math.ceil(self._timer))
 
+	-- Binds the game tick logic directly to Heartbeat instead of a spawn loop.
+	-- This coordinates mechanical ticks directly with Roblox's physical frame rate,
+	-- leading to smoother visual timer decrements.
 	self._hbConn = RunService.Heartbeat:Connect(function(dt)
-		if self._state ~= State.Opening then return end
+		if self._state ~= State.Opening then
+			return
+		end
 		self:_tickTimer(dt)
 		self:_tickBubbles(dt)
 	end)
@@ -415,13 +467,12 @@ function Workbench:_tickBubbles(dt: number)
 end
 
 --[[
- Spawns a bubble the player can click to shave time off the timer.
- The bubble pops itself automatically after a random lifespan even if
- never clicked, which is why _popBubble takes a byPlayer flag, only a
- player click grants the timer reduction, while an unclicked bubble just
- disappears with no reward. The tween handles the upward float, while
- task.delay independently tracks the pop timing so both can happen
- concurrently without polling every frame
+	Spawns a bubble that the player can click to speed up the opening process.
+	Each bubble runs on a dual-path cleanup: it will automatically fade out and self-destruct 
+	after its lifespan via task.delay, or pop instantly upon receiving a player's click.
+	
+	The click handler uses our standard _popBubble logic with the byPlayer flag set to true,
+	which triggers the local state's speed-up formula, whereas a timeout does not.
 ]]
 function Workbench:_spawnBubble()
 	local angle = math.random() * math.pi * 2
@@ -440,13 +491,14 @@ function Workbench:_spawnBubble()
 	model.Parent = workspace
 
 	local lifespan = Config.BubbleMinLife + math.random() * (Config.BubbleMaxLife - Config.BubbleMinLife)
-
 	local bubble: Bubble = { model = model, alive = true }
 
 	local cd = model:FindFirstChildOfClass("ClickDetector")
 	if cd then
 		cd.MouseClick:Connect(function()
-			if not bubble.alive then return end
+			if not bubble.alive then
+				return
+			end
 			self:_popBubble(bubble, true)
 		end)
 	end
@@ -469,25 +521,36 @@ function Workbench:_spawnBubble()
 	moveTween:Play()
 
 	task.delay(lifespan, function()
-		if bubble.alive then self:_popBubble(bubble, false) end
+		if bubble.alive then
+			self:_popBubble(bubble, false)
+		end
 	end)
 end
 
 function Workbench:_popBubble(bubble: Bubble, byPlayer: boolean)
-	if not bubble.alive then return end
+	if not bubble.alive then
+		return
+	end
 	bubble.alive = false
 
 	local idx = table.find(self._bubbles, bubble)
-	if idx then table.remove(self._bubbles, idx) end
+	if idx then
+		table.remove(self._bubbles, idx)
+	end
 
 	local part = bubble.model.PrimaryPart or bubble.model:FindFirstChildWhichIsA("BasePart")
 
 	if not part then
 		bubble.model:Destroy()
-		if byPlayer then self:_reduceTimer() end
+		if byPlayer then
+			self:_reduceTimer()
+		end
 		return
 	end
 
+	-- Simple tween animations for physical feedback (pop scale and transparency)
+	-- paired with Debris' queue system ensures that pop visuals play smoothly
+	-- without stalling the game thread with blocking waits.
 	local tween = TweenService:Create(part, TweenInfo.new(Config.BubblePopDuration, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
 		Size = part.Size * Config.BubblePopScale,
 		Transparency = 1,
@@ -495,15 +558,16 @@ function Workbench:_popBubble(bubble: Bubble, byPlayer: boolean)
 	tween:Play()
 	Debris:AddItem(bubble.model, Config.BubblePopDuration + 0.05)
 
-	if byPlayer then self:_reduceTimer() end
+	if byPlayer then
+		self:_reduceTimer()
+	end
 end
 
 --[[
- Reduces the timer when the player pops a bubble
- The TimerFloor exists to stop players from skipping the opening phase
- by spam-clicking bubbles: below that floor, the full click discount still
- applies. Once the timer already hit the floor, reductions go straight
- toward zero so the countdown can actually finish
+	Reduces the opening countdown timer when a player successfully clicks a bubble.
+	The Config.TimerFloor introduces a design boundary: players cannot skip the opening
+	sequence completely through spamming clicks. Once the timer descends past this floor,
+	click gains are applied directly to the final remaining time so it can finish naturally.
 ]]
 function Workbench:_reduceTimer()
 	if self._timer > Config.TimerFloor then
@@ -520,13 +584,17 @@ function Workbench:_clearBubbles()
 end
 
 --[[
- Transitions the workbench into the Opened state, plays the reveal
- animation, and grants the reward. The FinishGui auto-hides itself after
- RewardLifetime as a fallback in case the player never grabs the reward,
- returning the workbench to Idle so it doesn't stay stuck forever.
+	Transitions the workbench state to Opened, starting the reveal animations 
+	and physical reward generation. 
+	
+	A fallback timer (Config.RewardLifetime) is scheduled here: if the player neglects 
+	their reward, the workbench resets itself to Idle rather than remaining locked in 
+	limbo, preventing griefing/stalling mechanics in the server.
 ]]
 function Workbench:_enterOpened()
-	if self._state ~= State.Opening then return end
+	if self._state ~= State.Opening then
+		return
+	end
 
 	self._state = State.Opened
 
@@ -548,7 +616,9 @@ function Workbench:_enterOpened()
 		end
 	end)
 
-	if self._placer then recordBoxOpened(self._placer) end
+	if self._placer then
+		recordBoxOpened(self._placer)
+	end
 
 	task.delay(Config.RewardLifetime, function()
 		if self._state == State.Opened then
@@ -559,10 +629,14 @@ function Workbench:_enterOpened()
 end
 
 function Workbench:_animateBoxOpen(box: Model?, onDone: () -> ())
-	if not box then return onDone() end
+	if not box then
+		return onDone()
+	end
 
 	local part = box.PrimaryPart
-	if not part then return onDone() end
+	if not part then
+		return onDone()
+	end
 
 	local tween = TweenService:Create(part, TweenInfo.new(Config.BoxOpenAnimTime, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
 		Size = part.Size * 1.6,
@@ -574,14 +648,15 @@ function Workbench:_animateBoxOpen(box: Model?, onDone: () -> ())
 end
 
 --[[
- Spawns a random reward from the pool and gives it the same drag/limit
- behavior as the box, reusing the identical constraint and boundary logic
- so rewards feel consistent with boxes. Unlike the box, the reward isn't
- respawned on DragEnd since it's a one-time pickup, and it self-destructs
- after RewardLifetime if left unclaimed to avoid littering the workspace.
+	Spawns a random reward from the defined storage pool.
+	The physical interaction properties (such as physical constraints, 
+	limiting ranges, and client-drag responses) match the behavior of the boxes.
+	This reuses core physics algorithms to keep UX consistency across drag objects.
 ]]
 function Workbench:_spawnReward()
-	if #rewardPool == 0 then return end
+	if #rewardPool == 0 then
+		return
+	end
 
 	local chosen = rewardPool[math.random(1, #rewardPool)]
 	local reward = chosen:Clone()
@@ -592,7 +667,9 @@ function Workbench:_spawnReward()
 
 	CollectionService:AddTag(reward, "Reward")
 
-	local dd = Instance.new("DragDetector", reward)
+	-- Correct and non-deprecated property initialization pattern:
+	-- Instantiating parent-less, setting properties, and then parenting.
+	local dd = Instance.new("DragDetector")
 	dd.ResponseStyle = Enum.DragDetectorResponseStyle.Physical
 	dd.DragStyle = Enum.DragDetectorDragStyle.BestForDevice
 	dd.MaxForce = Config.RewardDragForce
@@ -613,17 +690,23 @@ function Workbench:_spawnReward()
 
 	dd.DragContinue:Connect(function(player: Player)
 		local char = player.Character
-		if not char then return end
+		if not char then
+			return
+		end
 
 		local hrp = char:FindFirstChild("HumanoidRootPart") :: BasePart?
 		local primary = reward.PrimaryPart
-		if not hrp or not primary then return end
+		if not hrp or not primary then
+			return
+		end
 
 		if (primary.Position - hrp.Position).Magnitude > Config.DragDistanceLimit then
 			primary.AssemblyLinearVelocity = Vector3.zero
 			primary.AssemblyAngularVelocity = Vector3.zero
 			dd.Enabled = false
-			task.defer(function() dd.Enabled = true end)
+			task.defer(function()
+				dd.Enabled = true
+			end)
 		end
 	end)
 
@@ -661,8 +744,12 @@ function Workbench:_spawnReward()
 		end
 	end)
 
+	dd.Parent = reward
+
 	task.delay(Config.RewardLifetime, function()
-		if reward and reward.Parent then reward:Destroy() end
+		if reward and reward.Parent then
+			reward:Destroy()
+		end
 	end)
 end
 
@@ -675,30 +762,53 @@ function Workbench:_burstParticles(visible: boolean)
 end
 
 --[[
- Disconnects every connection this workbench owns and pops any bubbles
- still alive. This runs when the model is destroyed (map cleanup, dynamic
- removal) to prevent dangling RBXScriptConnections and orphaned bubble
- models from leaking memory over a long server session
+	Systematically destroys the Workbench instance.
+	Clears local frames, stops active RunService heartbeats, disconnects physical events, 
+	and pops surviving bubble models. Crucial to ensure zero-dangling closure allocations
+	and prevent garbage collector leaks across dynamically loading maps.
 ]]
 function Workbench:Destroy()
-	if self._hbConn then self._hbConn:Disconnect() end
-	for _, conn in ipairs(self._conns) do conn:Disconnect() end
+	if self._hbConn then
+		self._hbConn:Disconnect()
+		self._hbConn = nil
+	end
+	for _, conn in ipairs(self._conns) do
+		conn:Disconnect()
+	end
 	table.clear(self._conns)
 	self:_clearBubbles()
 end
 
 local benches = {}
+
 for _, model in ipairs(WorkbenchFolder:GetChildren()) do
-	if model:IsA("Model") then table.insert(benches, Workbench.new(model)) end
+	if model:IsA("Model") then
+		table.insert(benches, Workbench.new(model))
+	end
 end
 
 WorkbenchFolder.ChildAdded:Connect(function(child)
-	if child:IsA("Model") then table.insert(benches, Workbench.new(child)) end
+	if child:IsA("Model") then
+		table.insert(benches, Workbench.new(child))
+	end
 end)
 
+--[[
+	Critical shutdown handling:
+	We capture game closure to force-save dirty player states.
+	We also systematically iterate through and clean up active Workbench states,
+	disconnecting active bindings and safely releasing engine allocations before 
+	the thread shuts down completely.
+]]
 game:BindToClose(function()
 	for _, player in ipairs(Players:GetPlayers()) do
 		task.spawn(saveSession, player)
 	end
+
+	for _, bench in ipairs(benches) do
+		bench:Destroy()
+	end
+	table.clear(benches)
+
 	task.wait(3)
 end)
